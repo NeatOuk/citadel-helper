@@ -25,13 +25,7 @@ library.
 
 ## Install
 
-From the AUR, if you're comfortable using it:
-
-```bash
-yay -S citadel-helper        # or: paru -S citadel-helper
-```
-
-Or build it yourself from this repository, with no AUR helper:
+Build and install it from this repository:
 
 ```bash
 git clone https://github.com/NeatOuk/citadel-helper.git
@@ -135,13 +129,6 @@ makepkg -si                      # build and install from the checkout
 
 The tests need no root and never touch your firewall. They check the generated
 rules, and that hostile inputs are rejected.
-
-### Releasing to the AUR
-
-1. Bump `pkgver` in `PKGBUILD` and `aur/PKGBUILD`.
-2. Tag and push the release: `git tag v1.1.0 && git push --tags`.
-3. In `aur/`, run `makepkg -f` to test the build, then `makepkg --printsrcinfo > .SRCINFO`.
-4. Push `aur/PKGBUILD`, `aur/.SRCINFO` and `aur/citadel-helper.install` to `ssh://aur@aur.archlinux.org/citadel-helper.git`.
 
 ## License
 
