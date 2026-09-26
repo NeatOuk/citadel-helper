@@ -25,7 +25,7 @@ library.
 
 ## Install
 
-Build and install it from this repository:
+Build and install it from this repository (an AUR package is coming later):
 
 ```bash
 git clone https://github.com/NeatOuk/citadel-helper.git
