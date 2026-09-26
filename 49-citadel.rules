@@ -1,0 +1,9 @@
+// Let the logged-in wheel user drive the Citadel firewall without a
+// password. citadel-enforcer only accepts validated IPs/ports and cgroups inside
+// the caller's own user slice, and only touches table inet citadel.
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.omarchy.citadel.enforce" &&
+      subject.local && subject.active && subject.isInGroup("wheel")) {
+    return polkit.Result.YES;
+  }
+});

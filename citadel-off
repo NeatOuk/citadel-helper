@@ -1,0 +1,6 @@
+#!/bin/bash
+# Panic switch: remove every Citadel firewall rule right now.
+if [[ $EUID -eq 0 ]]; then
+  exec /usr/lib/citadel/citadel-enforcer off
+fi
+exec pkexec /usr/lib/citadel/citadel-enforcer off

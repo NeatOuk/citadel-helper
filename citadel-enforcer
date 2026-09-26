@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Citadel enforcement backend. Runs as root (pkexec or systemd).
+
+Installed root-owned at /usr/lib/citadel/citadel-enforcer. A polkit rule
+lets the active local wheel user run it without a password, so it must
+treat every input as hostile: the spec file is written by the user, and
+only validated IPs, ports and cgroup paths under the caller's own
+user slice are ever turned into nftables rules. It only touches its own
+table (inet citadel) and never filters other users or system
+services.
+
+Usage:
+  citadel-enforcer apply <spec.json>    build the table from a spec, save it for boot
+  citadel-enforcer off                  delete the table and the saved spec
+  citadel-enforcer kill <kill.json>     tear down live sockets ([{cgroup?, ip?}])
+  citadel-enforcer restore              re-apply the saved spec (boot service)
+  citadel-enforcer status               print JSON: active + per-rule drop counters
+"""
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+TABLE = "citadel"
+STATE_DIR = "/var/lib/citadel"
+SAVED_SPEC = STATE_DIR + "/spec.json"
+CGROUP_ROOT = "/sys/fs/cgroup"
+MAX_SPEC_BYTES = 8 * 1024 * 1024
+MAX_ENTRIES = 5000          # per list, for rule lists
+MAX_BLOCKLIST = 300000      # IP blocklist subscription entries
+CGROUP_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+(/[A-Za-z0-9@._:\\-]+)*$")
+
+
+class SpecError(Exception):
+    pass
+
+
+def die(msg, code=1):
+    sys.stderr.write("citadel-enforcer: %s\n" % msg)
+    sys.exit(code)
+
+
+def caller_uid():
+    # pkexec sets PKEXEC_UID to the real caller. Never trust a uid from the spec.
+    v = os.environ.get("PKEXEC_UID", "")
+    if v.isdigit():
+        return int(v)
+    return None
+
+
+def read_json(path, limit=MAX_SPEC_BYTES):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise SpecError("cannot open %s: %s" % (path, e.strerror))
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read(limit + 1)
+    if len(raw) > limit:
+        raise SpecError("spec too large")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise SpecError("bad json: %s" % e)
+
+
+# ------------------------------------------------------------------ validation
+
+def v_net(s):
+    try:
+        n = ipaddress.ip_network(str(s).strip(), strict=False)
+    except ValueError:
+        raise SpecError("bad address %r" % (s,))
+    return n
+
+
+def v_port(p):
+    if p is None or p == "" or p == "*":
+        return None
+    try:
+        n = int(p)
+    except (TypeError, ValueError):
+        raise SpecError("bad port %r" % (p,))
+    if not 1 <= n <= 65535:
+        raise SpecError("bad port %r" % (p,))
+    return n
+
+
+def v_cgroup(path, uid):
+    s = str(path or "").strip().strip("/")
+    prefix = "user.slice/user-%d.slice/" % uid
+    if not s.startswith(prefix) or ".." in s.split("/") or not CGROUP_RE.match(s):
+        raise SpecError("cgroup outside the caller's user slice: %r" % (path,))
+    return s
+
+
+def v_list(x, name, limit=MAX_ENTRIES):
+    if x is None:
+        return []
+    if not isinstance(x, list):
+        raise SpecError("%s must be a list" % name)
+    if len(x) > limit:
+        raise SpecError("%s has too many entries" % name)
+    return x
+
+
+def v_target(t):
+    """{ip, port?} or "ip" -> (network, port|None)"""
+    if isinstance(t, dict):
+        return v_net(t.get("ip")), v_port(t.get("port"))
+    return v_net(t), None
+
+
+def validate(spec, uid):
+    """Spec: {silentDeny, blocklist:[cidr], rules:[entry]} where rules are
+    already ordered (first match wins) and each entry is
+      {verdict: "accept"|"drop", cgroup?: path, targets?: [{ip, port?}]}
+    or {blocklist: true} marking where the blocklist sets are checked."""
+    if not isinstance(spec, dict):
+        raise SpecError("spec must be an object")
+    rules = []
+    seen_blocklist = False
+    for e in v_list(spec.get("rules"), "rules"):
+        if not isinstance(e, dict):
+            raise SpecError("bad rule entry")
+        if e.get("blocklist") is True:
+            if not seen_blocklist:
+                rules.append({"blocklist": True})
+                seen_blocklist = True
+            continue
+        verdict = e.get("verdict")
+        if verdict not in ("accept", "drop"):
+            raise SpecError("bad verdict %r" % (verdict,))
+        cg = v_cgroup(e["cgroup"], uid) if e.get("cgroup") else None
+        tg = [v_target(t) for t in v_list(e.get("targets"), "targets")]
+        if not cg and not tg:
+            continue                      # nothing to match: skip, never "match all"
+        rules.append({"verdict": verdict, "cgroup": cg, "targets": tg})
+    if not seen_blocklist:
+        rules.append({"blocklist": True})
+    blocklist = [v_net(n) for n in v_list(spec.get("blocklist"), "blocklist", MAX_BLOCKLIST)]
+    return {"version": 2, "uid": uid, "silentDeny": bool(spec.get("silentDeny")),
+            "rules": rules, "blocklist": blocklist}
+
+
+def to_saved(v):
+    """Validated spec -> plain JSON (for /var/lib/citadel/spec.json)."""
+    rules = []
+    for r in v["rules"]:
+        if r.get("blocklist"):
+            rules.append({"blocklist": True})
+        else:
+            rules.append({"verdict": r["verdict"], "cgroup": r["cgroup"],
+                          "targets": [{"ip": str(n), "port": p} for n, p in r["targets"]]})
+    return {"version": 2, "uid": v["uid"], "silentDeny": v["silentDeny"], "rules": rules,
+            "blocklist": [str(n) for n in v["blocklist"]]}
+
+
+# ------------------------------------------------------------------ nft script
+
+def cg_exists(cg):
+    return os.path.isdir(os.path.join(CGROUP_ROOT, cg))
+
+
+def cg_expr(cg):
+    return 'socket cgroupv2 level %d "%s"' % (cg.count("/") + 1, cg)
+
+
+def target_rules(prefix, targets, verdict):
+    """Group targets by (family, port) into anonymous-set rules."""
+    groups = {}
+    for net, port in targets:
+        fam = "ip6" if net.version == 6 else "ip"
+        groups.setdefault((fam, port), []).append(str(net))
+    lines = []
+    for (fam, port), nets in sorted(groups.items(), key=lambda k: (k[0][0], k[0][1] or 0)):
+        nets = sorted(set(nets))
+        for i in range(0, len(nets), 500):
+            chunk = ", ".join(nets[i:i + 500])
+            m = "%s daddr { %s }" % (fam, chunk)
+            if port:
+                m += " th dport %d" % port
+            lines.append("    %s%s %s" % (prefix, m, "counter drop" if verdict == "drop" else "accept"))
+    return lines
+
+
+def build_script(v):
+    uid = v["uid"]
+    L = []
+    # Declaring then deleting the table first makes the whole reload one
+    # atomic transaction: there is never a moment with half the rules.
+    L.append("table inet %s {}" % TABLE)
+    L.append("delete table inet %s" % TABLE)
+    L.append("table inet %s {" % TABLE)
+    bl4 = sorted({str(n) for n in v["blocklist"] if n.version == 4})
+    bl6 = sorted({str(n) for n in v["blocklist"] if n.version == 6})
+    L.append("  set blocklist4 { type ipv4_addr; flags interval; auto-merge;%s }"
+             % (" elements = { %s };" % ", ".join(bl4) if bl4 else ""))
+    L.append("  set blocklist6 { type ipv6_addr; flags interval; auto-merge;%s }"
+             % (" elements = { %s };" % ", ".join(bl6) if bl6 else ""))
+    L.append("  chain output {")
+    L.append("    type filter hook output priority filter; policy accept;")
+    L.append("    ct state established,related accept")
+    L.append('    oifname "lo" accept')
+    L.append("    meta skuid != %d accept" % uid)          # only filter this user's apps
+    L.append("    meta l4proto { tcp, udp } th dport 53 accept")  # never break DNS
+    # User rules, in the order the Service sorted them (most specific first).
+    for r in v["rules"]:
+        if r.get("blocklist"):
+            L.append("    ip daddr @blocklist4 counter drop")
+            L.append("    ip6 daddr @blocklist6 counter drop")
+            continue
+        verdict = r["verdict"]
+        suffix = "counter drop" if verdict == "drop" else "accept"
+        if r["cgroup"]:
+            if not cg_exists(r["cgroup"]):
+                continue                  # app not running: nothing to match yet
+            if r["targets"]:
+                L += target_rules(cg_expr(r["cgroup"]) + " ", r["targets"], verdict)
+            else:
+                L.append("    %s %s" % (cg_expr(r["cgroup"]), suffix))
+        else:
+            L += target_rules("", r["targets"], verdict)
+    # 5. default
+    if v["silentDeny"]:
+        L.append("    counter drop")
+    L.append("  }")
+    L.append("}")
+    return "\n".join(L) + "\n"
+
+
+def nft(args, stdin=None):
+    p = subprocess.run(["nft"] + args, input=stdin, text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.returncode, p.stdout, p.stderr
+
+
+def apply_validated(v, save=True):
+    rc, _, err = nft(["-f", "-"], build_script(v))
+    if rc != 0:
+        die("nft failed: %s" % err.strip()[:2000])
+    if save:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        tmp = SAVED_SPEC + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(to_saved(v), f)
+        os.replace(tmp, SAVED_SPEC)
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_apply(path):
+    uid = caller_uid()
+    if uid is None:
+        die("apply must be run through pkexec")
+    try:
+        v = validate(read_json(path), uid)
+    except SpecError as e:
+        die(str(e))
+    apply_validated(v)
+    print(json.dumps({"ok": True, "active": True}))
+
+
+def cmd_restore():
+    if not os.path.exists(SAVED_SPEC):
+        return
+    try:
+        raw = read_json(SAVED_SPEC)
+        uid = int(raw.get("uid"))
+        v = validate(raw, uid)
+    except (SpecError, TypeError, ValueError) as e:
+        die("saved spec invalid: %s" % e)
+    apply_validated(v, save=False)
+
+
+def cmd_off():
+    nft(["delete", "table", "inet", TABLE])
+    try:
+        os.unlink(SAVED_SPEC)
+    except FileNotFoundError:
+        pass
+    print(json.dumps({"ok": True, "active": False}))
+
+
+def cmd_kill(path):
+    uid = caller_uid()
+    if uid is None:
+        die("kill must be run through pkexec")
+    try:
+        items = v_list(read_json(path, 1024 * 1024), "kill", 2000)
+        todo = []
+        for it in items:
+            if not isinstance(it, dict):
+                raise SpecError("bad kill entry")
+            cg = v_cgroup(it["cgroup"], uid) if it.get("cgroup") else None
+            ip = v_net(it["ip"]) if it.get("ip") else None
+            if not cg and not ip:
+                raise SpecError("kill entry needs cgroup or ip")
+            todo.append((cg, ip))
+    except SpecError as e:
+        die(str(e))
+    killed = 0
+    for cg, ip in todo:
+        expr = []
+        if cg:
+            expr += ["cgroup", "/" + cg]
+        if ip:
+            expr += ["dst", str(ip)]
+        for fam in ("-4", "-6"):
+            if ip and ((ip.version == 4) != (fam == "-4")):
+                continue
+            p = subprocess.run(["ss", "-K", "-H", fam, "-tu"] + expr,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            killed += len([l for l in p.stdout.splitlines() if l.strip()])
+    print(json.dumps({"ok": True, "killed": killed}))
+
+
+def cmd_status():
+    rc, out, _ = nft(["-j", "list", "table", "inet", TABLE])
+    if rc != 0:
+        print(json.dumps({"active": False, "drops": 0, "rules": 0}))
+        return
+    drops, rules = 0, 0
+    try:
+        for item in json.loads(out).get("nftables", []):
+            r = item.get("rule")
+            if not r:
+                continue
+            rules += 1
+            for e in r.get("expr", []):
+                c = e.get("counter") if isinstance(e, dict) else None
+                if c and any("drop" in x for x in r.get("expr", []) if isinstance(x, dict)):
+                    drops += int(c.get("packets", 0))
+    except ValueError:
+        pass
+    print(json.dumps({"active": True, "drops": drops, "rules": rules}))
+
+
+def main():
+    if os.geteuid() != 0:
+        die("must run as root (use pkexec)")
+    a = sys.argv[1:]
+    if not a:
+        die(__doc__.strip(), 2)
+    cmd = a[0]
+    if cmd == "apply" and len(a) == 2:
+        cmd_apply(a[1])
+    elif cmd == "kill" and len(a) == 2:
+        cmd_kill(a[1])
+    elif cmd == "off" and len(a) == 1:
+        cmd_off()
+    elif cmd == "restore" and len(a) == 1:
+        cmd_restore()
+    elif cmd == "status" and len(a) == 1:
+        cmd_status()
+    else:
+        die(__doc__.strip(), 2)
+
+
+if __name__ == "__main__":
+    main()

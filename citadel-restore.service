@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore Citadel firewall policies
+After=nftables.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/citadel/citadel-enforcer restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

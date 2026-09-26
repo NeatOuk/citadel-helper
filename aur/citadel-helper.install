@@ -1,0 +1,15 @@
+post_install() {
+  systemctl daemon-reload
+  systemctl enable citadel-restore.service >/dev/null 2>&1
+  echo "Citadel helper installed. Emergency off: citadel-off"
+  echo "Members of the 'wheel' group can drive Citadel's firewall without a password prompt."
+}
+
+post_upgrade() {
+  systemctl daemon-reload
+}
+
+pre_remove() {
+  /usr/lib/citadel/citadel-enforcer off >/dev/null 2>&1 || true
+  systemctl disable citadel-restore.service >/dev/null 2>&1 || true
+}

@@ -1,0 +1,9 @@
+# makepkg output
+src/
+pkg/
+*.pkg.tar.*
+aur/src/
+aur/pkg/
+aur/citadel-helper/
+aur/*.pkg.tar.*
+__pycache__/
