@@ -67,6 +67,7 @@ A passwordless root helper is only acceptable if it can't be misused, so
   - Anything else, including injection attempts, is rejected before nftables is called.
   - Symlinked input files are refused, and inputs have a size limit.
 - **No match-all mistakes.** A rule entry with nothing to match is dropped, never turned into "accept or drop everything".
+- **Optional connection log (1.2+).** When Citadel asks for it (`"logNew": true`, and only a real `true`), one fixed rule logs *new* connections from your apps to the kernel log, rate-limited to 20 per second. Citadel reads those lines to catch connections that end before its next check. The rule text is fixed, so the spec can only switch it on or off.
 - **Atomic updates.** Each apply replaces the whole table in a single nftables transaction, so there is never a half-applied state.
 - **Never breaks what's already running.**
   - Established connections are always accepted.
@@ -85,7 +86,7 @@ citadel-enforcer apply <spec.json>   build the table from Citadel's spec and sav
 citadel-enforcer kill <kill.json>    close your own live connections ([{cgroup, ip?}]; cgroup required)
 citadel-enforcer off                 delete the table and the saved spec
 citadel-enforcer restore             re-apply the saved spec (used by the boot service)
-citadel-enforcer status              JSON: {active, rules, drops, version}
+citadel-enforcer status              JSON: {active, rules, drops, logging, version}
 ```
 
 The spec is an **ordered** list, and the first match wins. Citadel sorts it most specific first:
@@ -93,6 +94,7 @@ The spec is an **ordered** list, and the first match wins. Citadel sorts it most
 ```json
 {
   "silentDeny": false,
+  "logNew": true,
   "blocklist": ["5.188.10.0/23"],
   "rules": [
     {"verdict": "drop",   "cgroup": "user.slice/user-1000.slice/…/app-chromium.scope",
@@ -108,6 +110,7 @@ The spec is an **ordered** list, and the first match wins. Citadel sorts it most
 - `targets` only matches destinations.
 - Both together match one app going to specific destinations.
 - `silentDeny` (Citadel's Lockdown mode) adds a final drop for anything not allowed earlier.
+- `logNew` adds the connection log rule described above.
 
 The last applied spec is kept in `/var/lib/citadel/spec.json`, which only root can read.
 

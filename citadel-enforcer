@@ -14,7 +14,7 @@ Usage:
   citadel-enforcer off                  delete the table and the saved spec
   citadel-enforcer kill <kill.json>     close the caller's live sockets ([{cgroup, ip?}])
   citadel-enforcer restore              re-apply the saved spec (boot service)
-  citadel-enforcer status               print JSON: active, rules, drops, version
+  citadel-enforcer status               print JSON: active, rules, drops, logging, version
 """
 import ipaddress
 import json
@@ -23,8 +23,13 @@ import re
 import subprocess
 import sys
 
-VERSION = "1.1.1"
+VERSION = "1.2.1"
 TABLE = "citadel"
+# New connections from the user's apps are logged to the kernel log (rate
+# limited) when the spec asks for it, so Citadel can see connections that end
+# before its next poll. The rule text is fixed; the spec only switches it on.
+LOG_RULE = 'ct state new limit rate 20/second burst 40 packets log prefix "citadel: " level info flags skuid'
+LOG_PREFIX = "citadel: "
 STATE_DIR = "/var/lib/citadel"
 SAVED_SPEC = STATE_DIR + "/spec.json"
 CGROUP_ROOT = "/sys/fs/cgroup"
@@ -142,7 +147,7 @@ def validate(spec, uid):
         rules.append({"blocklist": True})
     blocklist = [v_net(n) for n in v_list(spec.get("blocklist"), "blocklist", MAX_BLOCKLIST)]
     return {"version": 2, "uid": uid, "silentDeny": bool(spec.get("silentDeny")),
-            "rules": rules, "blocklist": blocklist}
+            "logNew": spec.get("logNew") is True, "rules": rules, "blocklist": blocklist}
 
 
 def to_saved(v):
@@ -154,7 +159,7 @@ def to_saved(v):
         else:
             rules.append({"verdict": r["verdict"], "cgroup": r["cgroup"],
                           "targets": [{"ip": str(n), "port": p} for n, p in r["targets"]]})
-    return {"version": 2, "uid": v["uid"], "silentDeny": v["silentDeny"], "rules": rules,
+    return {"version": 2, "uid": v["uid"], "silentDeny": v["silentDeny"], "logNew": v.get("logNew", False), "rules": rules,
             "blocklist": [str(n) for n in v["blocklist"]]}
 
 
@@ -206,6 +211,8 @@ def build_script(v):
     L.append('    oifname "lo" accept')
     L.append("    meta skuid != %d accept" % uid)          # only filter this user's apps
     L.append("    meta l4proto { tcp, udp } th dport 53 accept")  # never break DNS
+    if v.get("logNew"):
+        L.append("    " + LOG_RULE)
     # User rules, in the order the Service sorted them (most specific first).
     for r in v["rules"]:
         if r.get("blocklist"):
@@ -372,22 +379,24 @@ def cmd_kill(path):
 def cmd_status():
     rc, out, _ = nft(["-j", "list", "table", "inet", TABLE])
     if rc != 0:
-        print(json.dumps({"active": False, "drops": 0, "rules": 0, "version": VERSION}))
+        print(json.dumps({"active": False, "drops": 0, "rules": 0, "logging": False, "version": VERSION}))
         return
-    drops, rules = 0, 0
+    drops, rules, logging = 0, 0, False
     try:
         for item in json.loads(out).get("nftables", []):
             r = item.get("rule")
             if not r:
                 continue
             rules += 1
+            if any(isinstance(x, dict) and "log" in x for x in r.get("expr", [])):
+                logging = True
             for e in r.get("expr", []):
                 c = e.get("counter") if isinstance(e, dict) else None
                 if c and any("drop" in x for x in r.get("expr", []) if isinstance(x, dict)):
                     drops += int(c.get("packets", 0))
     except ValueError:
         pass
-    print(json.dumps({"active": True, "drops": drops, "rules": rules, "version": VERSION}))
+    print(json.dumps({"active": True, "drops": drops, "rules": rules, "logging": logging, "version": VERSION}))
 
 
 def main():

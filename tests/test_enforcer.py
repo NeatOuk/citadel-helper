@@ -94,6 +94,14 @@ def main():
               "\n\t\taccept\n" not in rs and "\n\t\tcounter packets 0 bytes 0 drop\n" not in rs, rs)
         check("saved for boot", os.path.exists(os.path.join(tmp, "state", "spec.json")))
 
+        check("no log rule unless asked", "log prefix" not in rs, rs)
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, logNew=True))
+        check("logNew adds the fixed log rule", rc == 0 and 'log prefix "citadel: "' in rs and "limit rate 20/second" in rs, rs)
+        check("log rule sits before user rules",
+              rs.find('log prefix "citadel: "') < rs.find("ip daddr 1.1.1.1 th dport 443"), rs)
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, logNew="yes"))
+        check("logNew must be a real boolean", rc == 0 and "log prefix" not in rs, rs)
+
         rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, silentDeny=True))
         check("lockdown adds final drop", rc == 0 and rs.rstrip().split("\n")[-3].strip().endswith("drop"), rs)
 
@@ -157,19 +165,30 @@ def main():
         check("kill skips sockets of another owner", res.get("killed") == 0 and res.get("skipped_other_owner", 0) >= 1, p.stdout + p.stderr)
         check("their connection stays up", alive in ("ALIVE=2", "ALIVE=1"), alive + p.stderr)
 
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, logNew=True))
+        with open(os.path.join(tmp, "status_runner.py"), "w") as f:
+            f.write(RUNNER % {"enforcer": ENFORCER, "state": os.path.join(tmp, "state")})
+        env = dict(os.environ, PKEXEC_UID=str(UID))
+        p = subprocess.run(["unshare", "-rn", "sh", "-c",
+                            "%s %s x apply %s >/dev/null && %s %s x status" % (sys.executable, os.path.join(tmp, "status_runner.py"), spec_path,
+                                                                             sys.executable, os.path.join(tmp, "status_runner.py"))],
+                           capture_output=True, text=True, env=env)
+        st = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
+        check("status reports version and logging", st.get("version") == "1.2.1" and st.get("logging") is True, p.stdout + p.stderr)
+
         rc, out, err, rs = run(tmp, ["off"])
         check("off removes the table", rc == 0 and "citadel" not in rs, rs)
 
     # ---- parser: uid is read per socket; root sockets have no uid field
     import runpy
     g = runpy.run_path(ENFORCER, run_name="citadel_enforcer_parse")
-    sample = ("ESTAB 0 0 192.168.5.6:45538 104.17.24.14:443 timer:(keepalive,12sec,0) uid:1000 ino:1 sk:2 cgroup:/user.slice/x\n"
+    sample = ("ESTAB 0 0 172.16.5.6:45538 104.17.24.14:443 timer:(keepalive,12sec,0) uid:1000 ino:1 sk:2 cgroup:/user.slice/x\n"
               "ESTAB 0 0 172.16.0.2:34731 162.159.36.1:443 ino:3 sk:4 cgroup:/user.slice/x\n"
               "UNCONN 0 0 [2001:db8::5]:5353 [2606:4700::1]:443 uid:1000 ino:5\n"
               "ESTAB 0 0 [fe80::1%wlan0]:22 [fe80::2%wlan0]:50000 uid:1001 ino:6\n")
     got = [(str(a), lp, str(b), rp, u) for a, lp, b, rp, u in g["parse_sockets"](sample)]
     check("parser reads owner uids (root = 0)", got == [
-        ("192.168.5.6", 45538, "104.17.24.14", 443, 1000),
+        ("172.16.5.6", 45538, "104.17.24.14", 443, 1000),
         ("172.16.0.2", 34731, "162.159.36.1", 443, 0),
         ("2001:db8::5", 5353, "2606:4700::1", 443, 1000),
         ("fe80::1", 22, "fe80::2", 50000, 1001)], got)
