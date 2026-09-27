@@ -12,9 +12,9 @@ services.
 Usage:
   citadel-enforcer apply <spec.json>    build the table from a spec, save it for boot
   citadel-enforcer off                  delete the table and the saved spec
-  citadel-enforcer kill <kill.json>     tear down live sockets ([{cgroup?, ip?}])
+  citadel-enforcer kill <kill.json>     close the caller's live sockets ([{cgroup, ip?}])
   citadel-enforcer restore              re-apply the saved spec (boot service)
-  citadel-enforcer status               print JSON: active + per-rule drop counters
+  citadel-enforcer status               print JSON: active, rules, drops, version
 """
 import ipaddress
 import json
@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 
+VERSION = "1.1.1"
 TABLE = "citadel"
 STATE_DIR = "/var/lib/citadel"
 SAVED_SPEC = STATE_DIR + "/spec.json"
@@ -284,7 +285,54 @@ def cmd_off():
     print(json.dumps({"ok": True, "active": False}))
 
 
+def _split_hostport(field):
+    """'1.2.3.4:443', '[2606::1]:443', 'fe80::1%eth0:22' -> (addr, port) or None"""
+    field = field.strip()
+    if field.startswith("["):
+        host, _, port = field[1:].partition("]:")
+    else:
+        host, _, port = field.rpartition(":")
+    host = host.split("%", 1)[0]
+    if not port.isdigit():
+        return None
+    try:
+        return ipaddress.ip_address(host), int(port)
+    except ValueError:
+        return None
+
+
+UID_RE = re.compile(r"\buid:(\d+)")
+
+
+def parse_sockets(text):
+    """ss -H -n -e output -> [(laddr, lport, raddr, rport, uid)].
+    ss prints no uid: field for root-owned sockets, so a missing uid is 0."""
+    out = []
+    for line in text.splitlines():
+        toks = line.split()
+        addrs = [t for t in toks if ":" in t and not t.startswith(("uid:", "ino:", "sk:", "cgroup:", "timer:", "users:"))]
+        if len(addrs) < 2:
+            continue
+        local, peer = _split_hostport(addrs[0]), _split_hostport(addrs[1])
+        if not local or not peer:
+            continue
+        m = UID_RE.search(line)
+        out.append((local[0], local[1], peer[0], peer[1], int(m.group(1)) if m else 0))
+    return out
+
+
+def _prefix(addr):
+    return "%s/%d" % (addr, 32 if addr.version == 4 else 128)
+
+
 def cmd_kill(path):
+    """Close live sockets for Citadel after a block.
+
+    Every entry must name a cgroup inside the caller's own user slice; an
+    optional ip narrows it. Sockets in that cgroup are listed first and only
+    those owned by the caller's uid are closed, one exact 4-tuple at a time,
+    so root-owned sockets (e.g. a sudo command run from a terminal) and other
+    users' sockets are never touched."""
     uid = caller_uid()
     if uid is None:
         die("kill must be run through pkexec")
@@ -294,33 +342,37 @@ def cmd_kill(path):
         for it in items:
             if not isinstance(it, dict):
                 raise SpecError("bad kill entry")
-            cg = v_cgroup(it["cgroup"], uid) if it.get("cgroup") else None
+            if not it.get("cgroup"):
+                raise SpecError("kill entry needs the caller's cgroup")
+            cg = v_cgroup(it["cgroup"], uid)
             ip = v_net(it["ip"]) if it.get("ip") else None
-            if not cg and not ip:
-                raise SpecError("kill entry needs cgroup or ip")
             todo.append((cg, ip))
     except SpecError as e:
         die(str(e))
-    killed = 0
+    killed = skipped = 0
     for cg, ip in todo:
-        expr = []
-        if cg:
-            expr += ["cgroup", "/" + cg]
-        if ip:
-            expr += ["dst", str(ip)]
-        for fam in ("-4", "-6"):
-            if ip and ((ip.version == 4) != (fam == "-4")):
-                continue
-            p = subprocess.run(["ss", "-K", "-H", fam, "-tu"] + expr,
+        if not cg_exists(cg):
+            continue
+        base = ["cgroup", "/" + cg] + (["dst", str(ip)] if ip else [])
+        for proto in ("-t", "-u"):
+            p = subprocess.run(["ss", "-H", "-n", "-e", proto] + base,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            killed += len([l for l in p.stdout.splitlines() if l.strip()])
-    print(json.dumps({"ok": True, "killed": killed}))
+            for laddr, lport, raddr, rport, owner in parse_sockets(p.stdout):
+                if owner != uid:
+                    skipped += 1
+                    continue
+                exact = ["src", _prefix(laddr), "sport", "=", ":%d" % lport,
+                         "dst", _prefix(raddr), "dport", "=", ":%d" % rport, "cgroup", "/" + cg]
+                k = subprocess.run(["ss", "-K", "-H", "-n", proto] + exact,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                killed += len([l for l in k.stdout.splitlines() if l.strip()])
+    print(json.dumps({"ok": True, "killed": killed, "skipped_other_owner": skipped}))
 
 
 def cmd_status():
     rc, out, _ = nft(["-j", "list", "table", "inet", TABLE])
     if rc != 0:
-        print(json.dumps({"active": False, "drops": 0, "rules": 0}))
+        print(json.dumps({"active": False, "drops": 0, "rules": 0, "version": VERSION}))
         return
     drops, rules = 0, 0
     try:
@@ -335,7 +387,7 @@ def cmd_status():
                     drops += int(c.get("packets", 0))
     except ValueError:
         pass
-    print(json.dumps({"active": True, "drops": drops, "rules": rules}))
+    print(json.dumps({"active": True, "drops": drops, "rules": rules, "version": VERSION}))
 
 
 def main():

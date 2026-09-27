@@ -70,7 +70,7 @@ A passwordless root helper is only acceptable if it can't be misused, so
 - **Atomic updates.** Each apply replaces the whole table in a single nftables transaction, so there is never a half-applied state.
 - **Never breaks what's already running.**
   - Established connections are always accepted.
-  - The helper only closes live connections when Citadel explicitly asks, after you block something.
+  - The helper only closes live connections when Citadel explicitly asks, after you block something. Every such request must name an app group (cgroup) inside your own user slice. The helper lists that group's sockets and closes only the ones owned by your uid, one exact connection at a time. Sockets of other users, and root-owned ones such as a `sudo` command started from your terminal, are never touched.
 
 The polkit rule is limited to local, active sessions of `wheel` members. That's
 the group that can already become root with sudo on Arch, so the rule gives no
@@ -82,10 +82,10 @@ Citadel calls these through `pkexec`. You normally never need them yourself.
 
 ```
 citadel-enforcer apply <spec.json>   build the table from Citadel's spec and save it for boot
-citadel-enforcer kill <kill.json>    close live connections ([{cgroup?, ip?}])
+citadel-enforcer kill <kill.json>    close your own live connections ([{cgroup, ip?}]; cgroup required)
 citadel-enforcer off                 delete the table and the saved spec
 citadel-enforcer restore             re-apply the saved spec (used by the boot service)
-citadel-enforcer status              JSON: {active, rules, drops}
+citadel-enforcer status              JSON: {active, rules, drops, version}
 ```
 
 The spec is an **ordered** list, and the first match wins. Citadel sorts it most specific first:
