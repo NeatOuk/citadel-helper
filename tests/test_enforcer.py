@@ -6,6 +6,7 @@ namespace (`unshare -rn`), where nftables works on a private, empty ruleset.
 Run: python3 tests/test_enforcer.py
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -14,6 +15,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENFORCER = os.path.join(HERE, "..", "citadel-enforcer")
 UID = os.getuid()
+with open(ENFORCER) as _f:
+    HELPER_VERSION = re.search(r'^VERSION = "([^"]+)"', _f.read(), re.M).group(1)
 SLICE = "user.slice/user-%d.slice/user@%d.service/app.slice" % (UID, UID)
 
 # Runs the enforcer with its state dir redirected into the temp dir, then
@@ -174,7 +177,39 @@ def main():
                                                                              sys.executable, os.path.join(tmp, "status_runner.py"))],
                            capture_output=True, text=True, env=env)
         st = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
-        check("status reports version and logging", st.get("version") == "1.2.1" and st.get("logging") is True, p.stdout + p.stderr)
+        check("status reports version and logging", st.get("version") == HELPER_VERSION and st.get("logging") is True, p.stdout + p.stderr)
+
+        # ---- proxy routing (1.3): validation and generated chains
+        base = {"rules": [{"verdict": "drop", "targets": [{"ip": "1.1.1.1"}]}]}
+        rc, out, err, rs = run(tmp, ["apply", spec_path], base)
+        check("no proxy section: no proxy chains", rc == 0 and "chain proxy" not in rs and "proxyudp" not in rs, rs)
+        check("filter chain runs before NAT (mangle)", "hook output priority mangle" in rs, rs)
+        px_ok = dict(base, proxy={"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": 47001},
+                                            {"verdict": "direct", "targets": [{"ip": "192.0.2.1"}]}],
+                                  "defaultPort": 47002, "exclude": ["172.16.1.3/32"]})
+        rc, out, err, rs = run(tmp, ["apply", spec_path], px_ok)
+        check("proxy: NAT chain at dstnat", rc == 0 and "hook output priority dstnat" in rs, err + rs)
+        check("proxy: only the caller's traffic", "meta skuid != %d return" % UID in rs, rs)
+        check("proxy: proxy servers and loopback excluded", "172.16.1.3" in rs and "127.0.0.0/8" in rs, rs)
+        check("proxy: app redirected to its listener", "redirect to :47001" in rs, rs)
+        check("proxy: direct route returns", "ip daddr 192.0.2.1 return" in rs, rs)
+        check("proxy: default route last", rs.find("redirect to :47002") > rs.find("redirect to :47001"), rs)
+        check("proxy: routed UDP is dropped (no QUIC leak)", "chain proxyudp" in rs and "jump proxyudp" in rs, rs)
+        for name, px in {
+            "privileged listener port": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": 80}]},
+            "listener port out of range": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": 70000}]},
+            "listener port as text": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": "47001"}]},
+            "listener port as bool": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": True}]},
+            "redirect without a port": {"rules": [{"verdict": "redirect", "cgroup": own_cg}]},
+            "unknown proxy verdict": {"rules": [{"verdict": "dnat", "cgroup": own_cg, "port": 47001}]},
+            "proxy rule in a system service": {"rules": [{"verdict": "redirect", "cgroup": "system.slice/warp-svc.service", "port": 47001}]},
+            "bad default port": {"rules": [], "defaultPort": 22},
+            "too many exclusions": {"rules": [], "defaultPort": 47001, "exclude": ["10.%d.0.0/16" % i for i in range(65)]},
+        }.items():
+            rc, out, err, rs = run(tmp, ["apply", spec_path], dict(base, proxy=px))
+            check("proxy rejects " + name, rc != 0 and "chain proxy" not in rs, err or rs)
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(base, proxy={"rules": [{"verdict": "redirect", "port": 47001}]}))
+        check("proxy rule with nothing to match is skipped", rc == 0 and "chain proxy" not in rs, err + rs)
 
         rc, out, err, rs = run(tmp, ["off"])
         check("off removes the table", rc == 0 and "citadel" not in rs, rs)

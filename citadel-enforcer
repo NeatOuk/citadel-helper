@@ -23,7 +23,7 @@ import re
 import subprocess
 import sys
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 TABLE = "citadel"
 # New connections from the user's apps are logged to the kernel log (rate
 # limited) when the spec asks for it, so Citadel can see connections that end
@@ -36,6 +36,7 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 MAX_SPEC_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 5000          # per list, for rule lists
 MAX_BLOCKLIST = 300000      # IP blocklist subscription entries
+MAX_EXCLUDE = 64            # proxy exclusions (proxy servers, their LANs)
 CGROUP_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+(/[A-Za-z0-9@._:\\-]+)*$")
 
 
@@ -147,7 +148,45 @@ def validate(spec, uid):
         rules.append({"blocklist": True})
     blocklist = [v_net(n) for n in v_list(spec.get("blocklist"), "blocklist", MAX_BLOCKLIST)]
     return {"version": 2, "uid": uid, "silentDeny": bool(spec.get("silentDeny")),
-            "logNew": spec.get("logNew") is True, "rules": rules, "blocklist": blocklist}
+            "logNew": spec.get("logNew") is True, "rules": rules, "blocklist": blocklist,
+            "proxy": v_proxy(spec.get("proxy"), uid)}
+
+
+def v_listen_port(p):
+    """Local listener of the user's citadel-proxy: an unprivileged port."""
+    if isinstance(p, bool) or not isinstance(p, int) or not 1024 <= p <= 65535:
+        raise SpecError("bad proxy listener port %r" % (p,))
+    return p
+
+
+def v_proxy(sec, uid):
+    """Proxy routing: {rules:[{verdict:"redirect"|"direct", cgroup?, targets?,
+    port?}], defaultPort?, exclude:[cidr]}. Rules are ordered (first match
+    wins); "redirect" sends the caller's matching TCP to a local listener
+    port, "direct" leaves it alone. Only the caller's own traffic is touched."""
+    if sec is None:
+        return None
+    if not isinstance(sec, dict):
+        raise SpecError("proxy must be an object")
+    rules = []
+    for e in v_list(sec.get("rules"), "proxy.rules"):
+        if not isinstance(e, dict):
+            raise SpecError("bad proxy rule")
+        verdict = e.get("verdict")
+        if verdict not in ("redirect", "direct"):
+            raise SpecError("bad proxy verdict %r" % (verdict,))
+        cg = v_cgroup(e["cgroup"], uid) if e.get("cgroup") else None
+        tg = [v_target(t) for t in v_list(e.get("targets"), "targets")]
+        if not cg and not tg:
+            continue                      # never "match all" by accident
+        port = v_listen_port(e.get("port")) if verdict == "redirect" else None
+        rules.append({"verdict": verdict, "cgroup": cg, "targets": tg, "port": port})
+    default = sec.get("defaultPort")
+    default = v_listen_port(default) if default is not None else None
+    exclude = [v_net(n) for n in v_list(sec.get("exclude"), "proxy.exclude", MAX_EXCLUDE)]
+    if not rules and default is None:
+        return None
+    return {"rules": rules, "defaultPort": default, "exclude": exclude}
 
 
 def to_saved(v):
@@ -159,8 +198,13 @@ def to_saved(v):
         else:
             rules.append({"verdict": r["verdict"], "cgroup": r["cgroup"],
                           "targets": [{"ip": str(n), "port": p} for n, p in r["targets"]]})
+    px = v.get("proxy")
+    if px:
+        px = {"rules": [{"verdict": r["verdict"], "cgroup": r["cgroup"], "port": r["port"],
+                         "targets": [{"ip": str(n), "port": p} for n, p in r["targets"]]} for r in px["rules"]],
+              "defaultPort": px["defaultPort"], "exclude": [str(n) for n in px["exclude"]]}
     return {"version": 2, "uid": v["uid"], "silentDeny": v["silentDeny"], "logNew": v.get("logNew", False), "rules": rules,
-            "blocklist": [str(n) for n in v["blocklist"]]}
+            "blocklist": [str(n) for n in v["blocklist"]], "proxy": px}
 
 
 # ------------------------------------------------------------------ nft script
@@ -173,7 +217,7 @@ def cg_expr(cg):
     return 'socket cgroupv2 level %d "%s"' % (cg.count("/") + 1, cg)
 
 
-def target_rules(prefix, targets, verdict):
+def target_rules(prefix, targets, verdict, stmt=None):
     """Group targets by (family, port) into anonymous-set rules."""
     groups = {}
     for net, port in targets:
@@ -187,7 +231,7 @@ def target_rules(prefix, targets, verdict):
             m = "%s daddr { %s }" % (fam, chunk)
             if port:
                 m += " th dport %d" % port
-            lines.append("    %s%s %s" % (prefix, m, "counter drop" if verdict == "drop" else "accept"))
+            lines.append("    %s%s %s" % (prefix, m, stmt or ("counter drop" if verdict == "drop" else "accept")))
     return lines
 
 
@@ -205,14 +249,20 @@ def build_script(v):
              % (" elements = { %s };" % ", ".join(bl4) if bl4 else ""))
     L.append("  set blocklist6 { type ipv6_addr; flags interval; auto-merge;%s }"
              % (" elements = { %s };" % ", ".join(bl6) if bl6 else ""))
+    px = v.get("proxy")
     L.append("  chain output {")
-    L.append("    type filter hook output priority filter; policy accept;")
+    # mangle (-150): after conntrack (-200), before NAT (-100), so block
+    # policies see a connection's original destination even when the proxy
+    # chain later redirects it to the local citadel-proxy listener
+    L.append("    type filter hook output priority mangle; policy accept;")
     L.append("    ct state established,related accept")
     L.append('    oifname "lo" accept')
     L.append("    meta skuid != %d accept" % uid)          # only filter this user's apps
     L.append("    meta l4proto { tcp, udp } th dport 53 accept")  # never break DNS
     if v.get("logNew"):
         L.append("    " + LOG_RULE)
+    if px:
+        L.append("    meta l4proto udp jump proxyudp")
     # User rules, in the order the Service sorted them (most specific first).
     for r in v["rules"]:
         if r.get("blocklist"):
@@ -234,8 +284,51 @@ def build_script(v):
     if v["silentDeny"]:
         L.append("    counter drop")
     L.append("  }")
+    if px:
+        L += proxy_chains(px, uid)
     L.append("}")
     return "\n".join(L) + "\n"
+
+
+def proxy_chains(px, uid):
+    """NAT redirect of routed TCP to the local citadel-proxy listener, plus a
+    filter chain that drops routed apps' UDP (except DNS) so QUIC and other
+    UDP can't leave around the proxy. Both follow the rule order."""
+    L = []
+    ex4 = sorted({str(n) for n in px["exclude"] if n.version == 4} | {"127.0.0.0/8"})
+    ex6 = sorted({str(n) for n in px["exclude"] if n.version == 6} | {"::1/128"})
+
+    def match_lines(r, stmt):
+        if r["cgroup"]:
+            if not cg_exists(r["cgroup"]):
+                return []
+            if r["targets"]:
+                return target_rules(cg_expr(r["cgroup"]) + " ", r["targets"], None, stmt)
+            return ["    %s %s" % (cg_expr(r["cgroup"]), stmt)]
+        return target_rules("", r["targets"], None, stmt)
+
+    L.append("  chain proxy {")
+    L.append("    type nat hook output priority dstnat; policy accept;")
+    L.append("    meta skuid != %d return" % uid)
+    L.append("    meta l4proto != tcp return")
+    L.append("    ip daddr { %s } return" % ", ".join(ex4))
+    L.append("    ip6 daddr { %s } return" % ", ".join(ex6))
+    for r in px["rules"]:
+        # nft needs the transport match in the same rule as a port redirect
+        stmt = "return" if r["verdict"] == "direct" else "meta l4proto tcp counter redirect to :%d" % r["port"]
+        L += match_lines(r, stmt)
+    if px["defaultPort"] is not None:
+        L.append("    meta l4proto tcp counter redirect to :%d" % px["defaultPort"])
+    L.append("  }")
+
+    L.append("  chain proxyudp {")
+    L.append("    th dport 53 return")
+    for r in px["rules"]:
+        L += match_lines(r, "return" if r["verdict"] == "direct" else "counter drop")
+    if px["defaultPort"] is not None:
+        L.append("    counter drop")
+    L.append("  }")
+    return L
 
 
 def nft(args, stdin=None):
@@ -379,9 +472,9 @@ def cmd_kill(path):
 def cmd_status():
     rc, out, _ = nft(["-j", "list", "table", "inet", TABLE])
     if rc != 0:
-        print(json.dumps({"active": False, "drops": 0, "rules": 0, "logging": False, "version": VERSION}))
+        print(json.dumps({"active": False, "drops": 0, "rules": 0, "logging": False, "proxy": False, "version": VERSION}))
         return
-    drops, rules, logging = 0, 0, False
+    drops, rules, logging, proxying = 0, 0, False, False
     try:
         for item in json.loads(out).get("nftables", []):
             r = item.get("rule")
@@ -390,13 +483,16 @@ def cmd_status():
             rules += 1
             if any(isinstance(x, dict) and "log" in x for x in r.get("expr", [])):
                 logging = True
+            if r.get("chain") == "proxy":
+                proxying = True
             for e in r.get("expr", []):
                 c = e.get("counter") if isinstance(e, dict) else None
                 if c and any("drop" in x for x in r.get("expr", []) if isinstance(x, dict)):
                     drops += int(c.get("packets", 0))
     except ValueError:
         pass
-    print(json.dumps({"active": True, "drops": drops, "rules": rules, "logging": logging, "version": VERSION}))
+    print(json.dumps({"active": True, "drops": drops, "rules": rules, "logging": logging,
+                      "proxy": proxying, "version": VERSION}))
 
 
 def main():

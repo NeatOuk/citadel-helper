@@ -1,6 +1,6 @@
 # Maintainer: Neat Ouk <neatk13@gmail.com>
 pkgname=citadel-helper
-pkgver=1.2.1
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Root helper, polkit rule and boot restore for the Citadel outbound firewall (Omarchy)"
 arch=('any')

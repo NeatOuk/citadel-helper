@@ -2,7 +2,7 @@
 # After editing any source file, refresh the checksums with: updpkgsums
 # (The AUR package in aur/ builds the same files from a tagged release.)
 pkgname=citadel-helper
-pkgver=1.2.1
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Root helper, polkit rule and boot restore for the Citadel outbound firewall (Omarchy)"
 arch=('any')
@@ -13,7 +13,7 @@ optdepends=('python-maxminddb: country lookup in the Citadel panel')
 install=citadel-helper.install
 source=('citadel-enforcer' 'citadel-off' 'org.omarchy.citadel.policy'
         '49-citadel.rules' 'citadel-restore.service' 'LICENSE')
-sha256sums=('e3e62aad0fe8e7bfd28d38304e8c2dcceeb0d8d2c676360fd13fafd2c33e0f1d'
+sha256sums=('d6d02aea1afe9cdd0666a0c026dd744a8b17a8502c2a4f125b1423e92665ab97'
             '715b796cfd74b62d91465eddc64fb8061d902ff4cd8ccc116ab98f6fc31b469a'
             'ec8b592fdc80f7b9bd32620159c96360f283927ceea88d169d02f7e888477540'
             'fe42934e7856e2d842a86d0430aa43e2459da0f660786129497a0a6f0f8efbf7'

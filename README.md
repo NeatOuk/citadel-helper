@@ -68,6 +68,7 @@ A passwordless root helper is only acceptable if it can't be misused, so
   - Symlinked input files are refused, and inputs have a size limit.
 - **No match-all mistakes.** A rule entry with nothing to match is dropped, never turned into "accept or drop everything".
 - **Optional connection log (1.2+).** When Citadel asks for it (`"logNew": true`, and only a real `true`), one fixed rule logs *new* connections from your apps to the kernel log, rate-limited to 20 per second. Citadel reads those lines to catch connections that end before its next check. The rule text is fixed, so the spec can only switch it on or off.
+- **Proxy redirects stay local (1.3+).** The optional `proxy` section can only redirect your own TCP connections (`meta skuid`) to a port on this machine (1024–65535), never to another host. Its cgroups must also be in your user slice, and loopback plus the listed proxy addresses are always exempt, so the proxy's own traffic can't loop.
 - **Atomic updates.** Each apply replaces the whole table in a single nftables transaction, so there is never a half-applied state.
 - **Never breaks what's already running.**
   - Established connections are always accepted.
@@ -86,7 +87,7 @@ citadel-enforcer apply <spec.json>   build the table from Citadel's spec and sav
 citadel-enforcer kill <kill.json>    close your own live connections ([{cgroup, ip?}]; cgroup required)
 citadel-enforcer off                 delete the table and the saved spec
 citadel-enforcer restore             re-apply the saved spec (used by the boot service)
-citadel-enforcer status              JSON: {active, rules, drops, logging, version}
+citadel-enforcer status              JSON: {active, rules, drops, logging, proxy, version}
 ```
 
 The spec is an **ordered** list, and the first match wins. Citadel sorts it most specific first:
@@ -111,6 +112,29 @@ The spec is an **ordered** list, and the first match wins. Citadel sorts it most
 - Both together match one app going to specific destinations.
 - `silentDeny` (Citadel's Lockdown mode) adds a final drop for anything not allowed earlier.
 - `logNew` adds the connection log rule described above.
+
+**Proxy routing (1.3+).** An optional `proxy` section sends chosen apps
+through Citadel's local proxy process (`bin/citadel-proxy` in the plugin):
+
+```json
+"proxy": {
+  "rules": [
+    {"verdict": "direct",   "cgroup": "user.slice/…/app-chromium.scope"},
+    {"verdict": "redirect", "cgroup": "user.slice/…/app-mail.scope", "port": 47001},
+    {"verdict": "redirect", "targets": [{"ip": "203.0.113.7", "port": 443}], "port": 47002}
+  ],
+  "defaultPort": 47001,
+  "exclude": ["172.16.1.3/32"]
+}
+```
+
+- It builds a NAT chain (`hook output priority dstnat`) that, in order:
+  - skips other users, non-TCP traffic, loopback and the `exclude` list
+  - runs the rules, first match wins: `direct` returns, `redirect` goes to `127.0.0.1:<port>`
+  - redirects the rest to `defaultPort`, if one is set
+- Routed apps' UDP is dropped except DNS, so they can't bypass the proxy over QUIC.
+- The filter chain runs at priority `mangle`, before NAT, so blocks always see the real destination.
+- If nothing listens on the port, the connection is refused, so it never goes direct.
 
 The last applied spec is kept in `/var/lib/citadel/spec.json`, which only root can read.
 
