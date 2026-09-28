@@ -1,0 +1,17 @@
+Source: citadel-helper
+Section: net
+Priority: optional
+Maintainer: Neat Ouk <neatk13@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/NeatOuk/citadel-helper
+Rules-Requires-Root: no
+
+Package: citadel-helper
+Architecture: all
+Depends: ${misc:Depends}, python3, nftables, iproute2, polkitd | policykit-1, systemd
+Description: root helper for the Citadel outbound firewall
+ A small, strictly validating root helper (called through pkexec) that turns
+ Citadel's per-app policies into one nftables table, restores them at boot,
+ and closes only the calling user's own connections. Members of the sudo
+ group can use it without a password prompt.

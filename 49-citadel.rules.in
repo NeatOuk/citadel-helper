@@ -1,0 +1,10 @@
+// Let the logged-in @ADMIN_GROUP@ user (the group that may already use sudo
+// on this distro) drive the Citadel firewall without a
+// password. citadel-enforcer only accepts validated IPs/ports and cgroups inside
+// the caller's own user slice, and only touches table inet citadel.
+polkit.addRule(function(action, subject) {
+  if (action.id == "io.github.neatouk.citadel.enforce" &&
+      subject.local && subject.active && subject.isInGroup("@ADMIN_GROUP@")) {
+    return polkit.Result.YES;
+  }
+});

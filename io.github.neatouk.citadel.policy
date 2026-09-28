@@ -2,8 +2,9 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <vendor>Citadel for Omarchy</vendor>
-  <action id="org.omarchy.citadel.enforce">
+  <vendor>Citadel</vendor>
+  <vendor_url>https://github.com/NeatOuk/citadel-helper</vendor_url>
+  <action id="io.github.neatouk.citadel.enforce">
     <description>Apply Citadel firewall policies</description>
     <message>Authentication is required to change the Citadel firewall</message>
     <defaults>

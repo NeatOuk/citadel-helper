@@ -37,7 +37,7 @@ Then open Citadel → **Settings** → **Enforcement** and switch it on. Citadel
 finds the helper within a few seconds.
 
 **Requirements:**
-- Arch Linux or Omarchy
+- Arch Linux (and Omarchy), Debian/Ubuntu, or Fedora. Packages: the PKGBUILD here; `.deb` and `.rpm` from `packaging/` (see Development)
 - `python`, `nftables`, `iproute2` and `polkit`
 - a kernel with `nft_socket`, cgroup v2 and `INET_DIAG_DESTROY`; the stock Arch kernel has all three
 - `python-maxminddb` (optional), for Citadel's country lookup
@@ -47,8 +47,8 @@ finds the helper within a few seconds.
 | Path | Purpose |
 |---|---|
 | `/usr/lib/citadel/citadel-enforcer` | The helper. Root-owned; the only thing that ever runs as root. |
-| `/usr/share/polkit-1/actions/org.omarchy.citadel.policy` | A polkit action that covers exactly that one program. |
-| `/usr/share/polkit-1/rules.d/49-citadel.rules` | Lets the active, local **`wheel`** user run it without a password. Anyone else is asked for an admin password. |
+| `/usr/share/polkit-1/actions/io.github.neatouk.citadel.policy` | A polkit action that covers exactly that one program. |
+| `/usr/share/polkit-1/rules.d/49-citadel.rules` | Lets the active, local member of the distro's admin group (**`wheel`** on Arch and Fedora, **`sudo`** on Debian and Ubuntu) run it without a password. Anyone else is asked for an admin password. |
 | `/usr/lib/systemd/system/citadel-restore.service` | Re-applies your last policies at boot, before the network comes up. Enabled on install. |
 | `/usr/bin/citadel-off` | **Emergency off.** Removes every Citadel rule immediately, from any terminal. |
 
@@ -152,7 +152,13 @@ Removing the package switches enforcement off first. Citadel then goes back to w
 python3 tests/test_enforcer.py   # runs the real enforcer in a private user+network namespace
 updpkgsums                       # after changing any file listed in PKGBUILD
 makepkg -si                      # build and install from the checkout
+packaging/build-in-docker.sh deb # .deb in an ubuntu:24.04 container (installs it there too)
+packaging/build-in-docker.sh rpm # .rpm in a fedora container
 ```
+
+`make install DESTDIR=… ADMIN_GROUP=wheel|sudo` installs the same files for
+other packaging; `ADMIN_GROUP` is the group whose members may run the helper
+without a password.
 
 The tests need no root and never touch your firewall. They check the generated
 rules, and that hostile inputs are rejected.

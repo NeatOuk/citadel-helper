@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/citadel-helper PREFIX=/usr ADMIN_GROUP=sudo UNITDIR=/usr/lib/systemd/system
+	rm -rf $(CURDIR)/debian/citadel-helper/usr/share/licenses
+
+override_dh_installsystemd:
+	dh_installsystemd --no-start citadel-restore.service

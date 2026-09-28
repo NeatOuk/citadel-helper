@@ -1,9 +1,12 @@
+49-citadel.rules
+aur/citadel-helper/
+aur/pkg/
+aur/*.pkg.tar.*
+aur/src/
 # makepkg output
-src/
+packaging/out/
 pkg/
 *.pkg.tar.*
-aur/src/
-aur/pkg/
-aur/citadel-helper/
-aur/*.pkg.tar.*
+*.pkg.tar.zst
 __pycache__/
+src/

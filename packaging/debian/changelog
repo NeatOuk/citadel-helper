@@ -1,0 +1,6 @@
+citadel-helper (1.3.1) unstable; urgency=medium
+
+  * Neutral polkit action (io.github.neatouk.citadel.enforce); the admin
+    group is the distro's own (sudo here).
+
+ -- Neat Ouk <neatk13@gmail.com>  Mon, 28 Sep 2026 10:00:00 +0700
