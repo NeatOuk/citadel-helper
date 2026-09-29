@@ -8,3 +8,13 @@ polkit.addRule(function(action, subject) {
     return polkit.Result.YES;
   }
 });
+
+// Let the same user read which names apps look up (systemd-resolved's query
+// monitor), so Citadel can show and match "api.example.com" instead of the
+// bare address. Read-only; it changes nothing in the resolver.
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.freedesktop.resolve1.subscribe-query-results" &&
+      subject.local && subject.active && subject.isInGroup("@ADMIN_GROUP@")) {
+    return polkit.Result.YES;
+  }
+});

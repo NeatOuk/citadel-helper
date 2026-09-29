@@ -1,5 +1,5 @@
 Name:           citadel-helper
-Version:        1.3.1
+Version:        1.3.2
 Release:        1%{?dist}
 Summary:        Root helper for the Citadel outbound firewall
 License:        MIT
@@ -49,5 +49,8 @@ if [ $1 -eq 0 ]; then %{_prefix}/lib/citadel/citadel-enforcer off >/dev/null 2>&
 %{_unitdir}/citadel-restore.service
 
 %changelog
+* Tue Sep 29 2026 Neat Ouk <neatk13@gmail.com> - 1.3.2-1
+- The admin group may also read systemd-resolved's query results (host names)
+
 * Mon Sep 28 2026 Neat Ouk <neatk13@gmail.com> - 1.3.1-1
 - Neutral polkit action; the admin group is the distro's own (wheel)

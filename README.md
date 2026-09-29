@@ -48,7 +48,7 @@ finds the helper within a few seconds.
 |---|---|
 | `/usr/lib/citadel/citadel-enforcer` | The helper. Root-owned; the only thing that ever runs as root. |
 | `/usr/share/polkit-1/actions/io.github.neatouk.citadel.policy` | A polkit action that covers exactly that one program. |
-| `/usr/share/polkit-1/rules.d/49-citadel.rules` | Lets the active, local member of the distro's admin group (**`wheel`** on Arch and Fedora, **`sudo`** on Debian and Ubuntu) run it without a password. Anyone else is asked for an admin password. |
+| `/usr/share/polkit-1/rules.d/49-citadel.rules` | Lets the active, local member of the distro's admin group (**`wheel`** on Arch and Fedora, **`sudo`** on Debian and Ubuntu) run it without a password. Anyone else is asked for an admin password. Since 1.3.2 it also lets that user read which names apps look up (systemd-resolved's query monitor), so Citadel can match `api.example.com` instead of a bare address. |
 | `/usr/lib/systemd/system/citadel-restore.service` | Re-applies your last policies at boot, before the network comes up. Enabled on install. |
 | `/usr/bin/citadel-off` | **Emergency off.** Removes every Citadel rule immediately, from any terminal. |
 
@@ -76,7 +76,9 @@ A passwordless root helper is only acceptable if it can't be misused, so
 
 The polkit rule is limited to local, active sessions of `wheel` members. That's
 the group that can already become root with sudo on Arch, so the rule gives no
-new power, it only skips the password prompt for this one program.
+new power, it only skips the password prompt for this one program. The same
+goes for the name lookups (1.3.2+): an admin could read them anyway, and the
+monitor is read-only.
 
 ## Commands
 
