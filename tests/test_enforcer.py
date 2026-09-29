@@ -6,6 +6,7 @@ namespace (`unshare -rn`), where nftables works on a private, empty ruleset.
 Run: python3 tests/test_enforcer.py
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -14,6 +15,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENFORCER = os.path.join(HERE, "..", "citadel-enforcer")
 UID = os.getuid()
+with open(ENFORCER) as _f:
+    HELPER_VERSION = re.search(r'^VERSION = "([^"]+)"', _f.read(), re.M).group(1)
 SLICE = "user.slice/user-%d.slice/user@%d.service/app.slice" % (UID, UID)
 
 # Runs the enforcer with its state dir redirected into the temp dir, then
@@ -94,6 +97,14 @@ def main():
               "\n\t\taccept\n" not in rs and "\n\t\tcounter packets 0 bytes 0 drop\n" not in rs, rs)
         check("saved for boot", os.path.exists(os.path.join(tmp, "state", "spec.json")))
 
+        check("no log rule unless asked", "log prefix" not in rs, rs)
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, logNew=True))
+        check("logNew adds the fixed log rule", rc == 0 and 'log prefix "citadel: "' in rs and "limit rate 20/second" in rs, rs)
+        check("log rule sits before user rules",
+              rs.find('log prefix "citadel: "') < rs.find("ip daddr 1.1.1.1 th dport 443"), rs)
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, logNew="yes"))
+        check("logNew must be a real boolean", rc == 0 and "log prefix" not in rs, rs)
+
         rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, silentDeny=True))
         check("lockdown adds final drop", rc == 0 and rs.rstrip().split("\n")[-3].strip().endswith("drop"), rs)
 
@@ -157,19 +168,62 @@ def main():
         check("kill skips sockets of another owner", res.get("killed") == 0 and res.get("skipped_other_owner", 0) >= 1, p.stdout + p.stderr)
         check("their connection stays up", alive in ("ALIVE=2", "ALIVE=1"), alive + p.stderr)
 
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(good, logNew=True))
+        with open(os.path.join(tmp, "status_runner.py"), "w") as f:
+            f.write(RUNNER % {"enforcer": ENFORCER, "state": os.path.join(tmp, "state")})
+        env = dict(os.environ, PKEXEC_UID=str(UID))
+        p = subprocess.run(["unshare", "-rn", "sh", "-c",
+                            "%s %s x apply %s >/dev/null && %s %s x status" % (sys.executable, os.path.join(tmp, "status_runner.py"), spec_path,
+                                                                             sys.executable, os.path.join(tmp, "status_runner.py"))],
+                           capture_output=True, text=True, env=env)
+        st = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
+        check("status reports version and logging", st.get("version") == HELPER_VERSION and st.get("logging") is True, p.stdout + p.stderr)
+
+        # ---- proxy routing (1.3): validation and generated chains
+        base = {"rules": [{"verdict": "drop", "targets": [{"ip": "1.1.1.1"}]}]}
+        rc, out, err, rs = run(tmp, ["apply", spec_path], base)
+        check("no proxy section: no proxy chains", rc == 0 and "chain proxy" not in rs and "proxyudp" not in rs, rs)
+        check("filter chain runs before NAT (mangle)", "hook output priority mangle" in rs, rs)
+        px_ok = dict(base, proxy={"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": 47001},
+                                            {"verdict": "direct", "targets": [{"ip": "192.0.2.1"}]}],
+                                  "defaultPort": 47002, "exclude": ["172.16.1.3/32"]})
+        rc, out, err, rs = run(tmp, ["apply", spec_path], px_ok)
+        check("proxy: NAT chain at dstnat", rc == 0 and "hook output priority dstnat" in rs, err + rs)
+        check("proxy: only the caller's traffic", "meta skuid != %d return" % UID in rs, rs)
+        check("proxy: proxy servers and loopback excluded", "172.16.1.3" in rs and "127.0.0.0/8" in rs, rs)
+        check("proxy: app redirected to its listener", "redirect to :47001" in rs, rs)
+        check("proxy: direct route returns", "ip daddr 192.0.2.1 return" in rs, rs)
+        check("proxy: default route last", rs.find("redirect to :47002") > rs.find("redirect to :47001"), rs)
+        check("proxy: routed UDP is dropped (no QUIC leak)", "chain proxyudp" in rs and "jump proxyudp" in rs, rs)
+        for name, px in {
+            "privileged listener port": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": 80}]},
+            "listener port out of range": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": 70000}]},
+            "listener port as text": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": "47001"}]},
+            "listener port as bool": {"rules": [{"verdict": "redirect", "cgroup": own_cg, "port": True}]},
+            "redirect without a port": {"rules": [{"verdict": "redirect", "cgroup": own_cg}]},
+            "unknown proxy verdict": {"rules": [{"verdict": "dnat", "cgroup": own_cg, "port": 47001}]},
+            "proxy rule in a system service": {"rules": [{"verdict": "redirect", "cgroup": "system.slice/warp-svc.service", "port": 47001}]},
+            "bad default port": {"rules": [], "defaultPort": 22},
+            "too many exclusions": {"rules": [], "defaultPort": 47001, "exclude": ["10.%d.0.0/16" % i for i in range(65)]},
+        }.items():
+            rc, out, err, rs = run(tmp, ["apply", spec_path], dict(base, proxy=px))
+            check("proxy rejects " + name, rc != 0 and "chain proxy" not in rs, err or rs)
+        rc, out, err, rs = run(tmp, ["apply", spec_path], dict(base, proxy={"rules": [{"verdict": "redirect", "port": 47001}]}))
+        check("proxy rule with nothing to match is skipped", rc == 0 and "chain proxy" not in rs, err + rs)
+
         rc, out, err, rs = run(tmp, ["off"])
         check("off removes the table", rc == 0 and "citadel" not in rs, rs)
 
     # ---- parser: uid is read per socket; root sockets have no uid field
     import runpy
     g = runpy.run_path(ENFORCER, run_name="citadel_enforcer_parse")
-    sample = ("ESTAB 0 0 192.168.5.6:45538 104.17.24.14:443 timer:(keepalive,12sec,0) uid:1000 ino:1 sk:2 cgroup:/user.slice/x\n"
+    sample = ("ESTAB 0 0 172.16.5.6:45538 104.17.24.14:443 timer:(keepalive,12sec,0) uid:1000 ino:1 sk:2 cgroup:/user.slice/x\n"
               "ESTAB 0 0 172.16.0.2:34731 162.159.36.1:443 ino:3 sk:4 cgroup:/user.slice/x\n"
               "UNCONN 0 0 [2001:db8::5]:5353 [2606:4700::1]:443 uid:1000 ino:5\n"
               "ESTAB 0 0 [fe80::1%wlan0]:22 [fe80::2%wlan0]:50000 uid:1001 ino:6\n")
     got = [(str(a), lp, str(b), rp, u) for a, lp, b, rp, u in g["parse_sockets"](sample)]
     check("parser reads owner uids (root = 0)", got == [
-        ("192.168.5.6", 45538, "104.17.24.14", 443, 1000),
+        ("172.16.5.6", 45538, "104.17.24.14", 443, 1000),
         ("172.16.0.2", 34731, "162.159.36.1", 443, 0),
         ("2001:db8::5", 5353, "2606:4700::1", 443, 1000),
         ("fe80::1", 22, "fe80::2", 50000, 1001)], got)

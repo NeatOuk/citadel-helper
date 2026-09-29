@@ -1,8 +1,8 @@
 # Maintainer: Neat Ouk <neatk13@gmail.com>
 pkgname=citadel-helper
-pkgver=1.1.1
+pkgver=1.3.2
 pkgrel=1
-pkgdesc="Root helper, polkit rule and boot restore for the Citadel outbound firewall (Omarchy)"
+pkgdesc="Root helper, polkit rule and boot restore for the Citadel outbound firewall"
 arch=('any')
 url="https://github.com/NeatOuk/citadel-helper"
 license=('MIT')
@@ -17,7 +17,8 @@ package() {
   cd "$pkgname"
   install -Dm755 citadel-enforcer "$pkgdir/usr/lib/citadel/citadel-enforcer"
   install -Dm755 citadel-off "$pkgdir/usr/bin/citadel-off"
-  install -Dm644 org.omarchy.citadel.policy "$pkgdir/usr/share/polkit-1/actions/org.omarchy.citadel.policy"
+  install -Dm644 io.github.neatouk.citadel.policy "$pkgdir/usr/share/polkit-1/actions/io.github.neatouk.citadel.policy"
+  sed 's/@ADMIN_GROUP@/wheel/g' 49-citadel.rules.in > 49-citadel.rules
   install -Dm644 49-citadel.rules "$pkgdir/usr/share/polkit-1/rules.d/49-citadel.rules"
   install -Dm644 citadel-restore.service "$pkgdir/usr/lib/systemd/system/citadel-restore.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

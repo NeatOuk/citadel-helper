@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+  /usr/lib/citadel/citadel-enforcer off >/dev/null 2>&1 || true
+fi
+#DEBHELPER#
