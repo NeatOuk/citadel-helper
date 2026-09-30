@@ -1,8 +1,9 @@
 # citadel-helper
 
-The root side of [Citadel](https://github.com/NeatOuk/citadel), the outbound
-firewall for the Omarchy bar. It is a small, audited program that turns
-Citadel's policies into nftables rules. It installs a polkit rule so it can do
+The root side of Citadel, the outbound firewall for Linux. It serves both
+editions: the [bar plugin](https://github.com/NeatOuk/citadel) and the
+[standalone app](https://github.com/NeatOuk/citadel-app). It is a small, audited
+program that turns Citadel's policies into nftables rules. It installs a polkit rule so it can do
 that without asking for a password, and restores your policies at boot.
 
 Citadel works without it, but then it only **watches**. You see every connection
@@ -11,13 +12,13 @@ Citadel **enforce** what you decide.
 
 ## Why a separate package?
 
-Blocking traffic means changing the kernel firewall, and that needs root. An
-Omarchy shell plugin can't have root:
-- It runs as you, inside the shell.
-- The plugin store only copies files into your home directory.
+Blocking traffic means changing the kernel firewall, and that needs root.
+Citadel itself never has root:
+- The bar plugin runs as you, inside your desktop shell, and installs into your home directory.
+- The app runs as you, as a user service.
 
-So the one privileged part lives here, as a normal pacman package that you
-install on purpose and can remove with pacman.
+So the one privileged part lives here, as a normal system package (pacman,
+`.deb` or `.rpm`) that you install on purpose and can remove the same way.
 
 Keeping it separate also keeps it small enough to read. Everything that runs as
 root is one Python file, `citadel-enforcer`, that uses only the standard
@@ -33,11 +34,11 @@ cd citadel-helper
 makepkg -si
 ```
 
-Then open Citadel → **Settings** → **Enforcement** and switch it on. Citadel
+Then open Citadel (the bar plugin or the app) → **Settings** → **Enforcement** and switch it on. Citadel
 finds the helper within a few seconds.
 
 **Requirements:**
-- Arch Linux (and Omarchy), Debian/Ubuntu, or Fedora. Packages: the PKGBUILD here; `.deb` and `.rpm` from `packaging/` (see Development)
+- Arch Linux, Debian/Ubuntu, or Fedora. Packages: the PKGBUILD here; `.deb` and `.rpm` from `packaging/` (see Development)
 - `python`, `nftables`, `iproute2` and `polkit`
 - a kernel with `nft_socket`, cgroup v2 and `INET_DIAG_DESTROY`; the stock Arch kernel has all three
 - `python-maxminddb` (optional), for Citadel's country lookup
@@ -116,7 +117,7 @@ The spec is an **ordered** list, and the first match wins. Citadel sorts it most
 - `logNew` adds the connection log rule described above.
 
 **Proxy routing (1.3+).** An optional `proxy` section sends chosen apps
-through Citadel's local proxy process (`bin/citadel-proxy` in the plugin):
+through Citadel's local proxy process (`citadel-proxy`, shipped with the plugin and the app):
 
 ```json
 "proxy": {
