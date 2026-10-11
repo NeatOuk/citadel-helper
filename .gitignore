@@ -10,3 +10,5 @@ pkg/
 *.pkg.tar.zst
 __pycache__/
 src/
+
+CLAUDE.md
